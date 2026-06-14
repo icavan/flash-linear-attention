@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from fla.ops.simple_gla.chunk import chunk_simple_gla
 from fla.ops.simple_gla.fused_chunk import fused_chunk_simple_gla
 from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
-from fla.ops.simple_gla.naive import naive_parallel_simple_gla, naive_recurrent_simple_gla
+from fla.ops.simple_gla.naive import naive_chunk_simple_gla, naive_parallel_simple_gla, naive_recurrent_simple_gla
 from fla.ops.simple_gla.parallel import parallel_simple_gla
 from fla.utils import assert_close, device
 
@@ -369,6 +369,66 @@ def test_chunk_state_v_first(
     assert_close('dv', ref_dv, tri_dv, 0.005)
     assert_close('dg', ref_dg, tri_dg, 0.005, err_atol=2e-4)
     assert_close('dh0', ref_dh0, tri_dh0.transpose(-1, -2), 0.005)
+
+
+def test_chunk_gva_matches_repeated_qk() -> None:
+    torch.manual_seed(42)
+    os.environ['TRITON_F32_DEFAULT'] = 'ieee'
+
+    B, T, H, HV, D = 1, 32, 2, 4, 16
+    scale = 0.7
+    groups = HV // H
+
+    q = torch.randn((B, T, H, D), dtype=torch.float32, device=device).requires_grad_(True)
+    k = torch.randn((B, T, H, D), dtype=torch.float32, device=device).requires_grad_(True)
+    v = torch.randn((B, T, HV, D), dtype=torch.float32, device=device).requires_grad_(True)
+    g = F.logsigmoid(torch.randn((B, T, HV), dtype=torch.float32, device=device)).requires_grad_(True)
+    h0 = torch.randn((B, HV, D, D), dtype=torch.float32, device=device).requires_grad_(True)
+    do = torch.randn_like(v)
+    dht = torch.randn_like(h0)
+
+    native_out, native_ht = chunk_simple_gla(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        scale=scale,
+        initial_state=h0,
+        output_final_state=True,
+    )
+    ((native_out * do).sum() + (native_ht * dht).sum()).backward()
+    native_dq, q.grad = q.grad.clone(), None
+    native_dk, k.grad = k.grad.clone(), None
+    native_dv, v.grad = v.grad.clone(), None
+    native_dg, g.grad = g.grad.clone(), None
+    native_dh0, h0.grad = h0.grad.clone(), None
+
+    q_ref = q.detach().repeat_interleave(groups, dim=2).requires_grad_(True)
+    k_ref = k.detach().repeat_interleave(groups, dim=2).requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    g_ref = g.detach().clone().requires_grad_(True)
+    h0_ref = h0.detach().clone().requires_grad_(True)
+
+    ref_out, ref_ht = naive_chunk_simple_gla(
+        q=q_ref,
+        k=k_ref,
+        v=v_ref,
+        g=g_ref,
+        scale=scale,
+        initial_state=h0_ref,
+        output_final_state=True,
+    )
+    ((ref_out * do).sum() + (ref_ht * dht).sum()).backward()
+    ref_dq = q_ref.grad.view(B, T, H, groups, D).sum(3)
+    ref_dk = k_ref.grad.view(B, T, H, groups, D).sum(3)
+
+    assert_close('o', ref_out, native_out, 0.005)
+    assert_close('ht', ref_ht, native_ht, 0.005)
+    assert_close('dq', ref_dq, native_dq, 0.005)
+    assert_close('dk', ref_dk, native_dk, 0.005)
+    assert_close('dv', v_ref.grad, native_dv, 0.005)
+    assert_close('dg', g_ref.grad, native_dg, 0.005, err_atol=2e-4)
+    assert_close('dh0', h0_ref.grad, native_dh0, 0.005)
 
 
 @pytest.mark.parametrize(

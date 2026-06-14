@@ -256,26 +256,27 @@ def chunk_simple_gla(
         k (torch.Tensor):
             keys of shape `[B, T, H, K]`.
         v (torch.Tensor):
-            values of shape `[B, T, H, V]`.
+            values of shape `[B, T, HV, V]`.
         g (Optional[torch.Tensor]):
-            Forget gates of shape `[B, T, H]`.
+            Forget gates of shape `[B, T, HV]`.
             Compared to GLA, the gating is head-wise instead of elementwise.
+            When `HV != H`, each query/key head is shared across `HV // H` value heads.
             Default: `None`.
         g_gamma (Optional[torch.Tensor]):
-            Log decay of shape `[H]`.
+            Log decay of shape `[HV]`.
             Head-wise data-independent decay is used if `g_gamma` is provided.
             Only one of `g` or `g_gamma` should be provided. Default: `None`.
         scale (Optional[float]):
             Scale factor for the attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` (or `[N, H, V, K]` if `state_v_first=True`)
+            Initial state of shape `[N, HV, K, V]` (or `[N, HV, V, K]` if `state_v_first=True`)
             for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
         output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`
-            (or `[N, H, V, K]` if `state_v_first=True`). Default: `False`.
+            Whether to output the final state of shape `[N, HV, K, V]`
+            (or `[N, HV, V, K]` if `state_v_first=True`). Default: `False`.
         state_v_first (Optional[bool]):
             Store the recurrent state in V-first `[V, K]` layout instead of the default `[K, V]`. Default: `False`.
         cu_seqlens (torch.LongTensor):
@@ -286,9 +287,9 @@ def chunk_simple_gla(
 
     Returns:
         o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]`.
+            Outputs of shape `[B, T, HV, V]`.
         final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` (or `[N, H, V, K]` if `state_v_first=True`)
+            Final state of shape `[N, HV, K, V]` (or `[N, HV, V, K]` if `state_v_first=True`)
             if `output_final_state=True` else `None`.
 
     Examples::
@@ -321,6 +322,24 @@ def chunk_simple_gla(
     if 'head_first' in kwargs:
         raise DeprecationWarning(
             "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
+        )
+    if q.shape[:2] != k.shape[:2] or q.shape[:2] != v.shape[:2]:
+        raise ValueError("Expected `q`, `k`, and `v` to share the same batch and sequence dimensions.")
+    if q.shape[2] != k.shape[2]:
+        raise ValueError(f"Expected `q` and `k` to have the same number of heads, got {q.shape[2]} and {k.shape[2]}.")
+    if q.shape[-1] != k.shape[-1]:
+        raise ValueError(f"Expected `q` and `k` to have the same head dimension, got {q.shape[-1]} and {k.shape[-1]}.")
+    H = q.shape[2]
+    HV = v.shape[2]
+    if HV < H or HV % H != 0:
+        raise ValueError(f"Expected `v` heads ({HV}) to be a multiple of `q/k` heads ({H}).")
+    if g is not None and g.shape != v.shape[:-1]:
+        raise ValueError(f"Expected `g` to have shape {v.shape[:-1]}, got {tuple(g.shape)}.")
+    if g_gamma is not None and g_gamma.shape != (HV,):
+        raise ValueError(f"Expected `g_gamma` to have shape ({HV},), got {tuple(g_gamma.shape)}.")
+    if initial_state is not None and initial_state.shape[1] != HV:
+        raise ValueError(
+            f"Expected `initial_state` to have {HV} heads to match `v`, got {initial_state.shape[1]}."
         )
     if cu_seqlens is not None:
         if q.shape[0] != 1:

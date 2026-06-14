@@ -47,6 +47,7 @@ def chunk_fwd_kernel_h(
     split_offsets,
     T,
     H: tl.constexpr,
+    HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -63,7 +64,8 @@ def chunk_fwd_kernel_h(
     STATE_V_FIRST: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_h = i_nh // H, i_nh % H
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
@@ -76,8 +78,8 @@ def chunk_fwd_kernel_h(
     NTS = BS // BT
 
     if USE_G_GAMMA:
-        # decay rate given the head index
-        b_gamma = tl.load(g_gamma + i_h)
+        # decay rate given the value-head index
+        b_gamma = tl.load(g_gamma + i_hv)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
 
     # [BK, BV] accumulator; STATE_V_FIRST only flips the stored state's HBM layout to [V, K], applied at the load/store below.
@@ -93,9 +95,9 @@ def chunk_fwd_kernel_h(
     for i_t in range(NT):
         i_s = i_t // NTS
         p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (K, T), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        p_v = tl.make_block_ptr(v + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_v = tl.make_block_ptr(v + (bos*HV + i_hv) * V, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
 
-        o_h = ((boh + i_s) * H + i_h).to(tl.int64) * K*V
+        o_h = ((boh + i_s) * HV + i_hv).to(tl.int64) * K*V
         if STATE_V_FIRST:
             p_h = tl.make_block_ptr(h + o_h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
         else:
@@ -111,8 +113,8 @@ def chunk_fwd_kernel_h(
 
         # scalar decay
         if USE_G:
-            b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-            p_g = g + bos*H + (i_t * BT + tl.arange(0, BT)) * H + i_h
+            b_g_last = tl.load(g + bos * HV + last_idx * HV + i_hv)
+            p_g = g + bos*HV + (i_t * BT + tl.arange(0, BT)) * HV + i_hv
             b_g = tl.load(p_g, mask=(i_t * BT + tl.arange(0, BT) < T), other=0.)
             b_h *= exp2(b_g_last)
             b_v = (b_v * exp2(b_g_last - b_g)[:, None]).to(b_v.dtype)
@@ -134,8 +136,8 @@ def chunk_fwd_kernel_h(
 
         # vector decay, h = h @ Diag(gv)
         if USE_GV:
-            p_gv = tl.make_block_ptr(gv + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            p_gv_last = gv + (bos + last_idx) * H*V + i_h * V + i_v * BV + tl.arange(0, BV)
+            p_gv = tl.make_block_ptr(gv + (bos*HV + i_hv) * V, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_gv_last = gv + (bos + last_idx) * HV*V + i_hv * V + i_v * BV + tl.arange(0, BV)
 
             b_gv_last = tl.load(p_gv_last, mask=(i_v * BV + tl.arange(0, BV) < V), other=0.)
             b_gv = tl.load(p_gv, boundary_check=(0, 1))
@@ -184,8 +186,8 @@ def chunk_bwd_kernel_dh(
     split_offsets,
     scale,
     T,
-    HQ: tl.constexpr,
     H: tl.constexpr,
+    HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -203,8 +205,8 @@ def chunk_bwd_kernel_dh(
     STATE_V_FIRST: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hq = i_nh // HQ, i_nh % HQ
-    i_h = i_hq // NG
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // NG
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
@@ -218,7 +220,7 @@ def chunk_bwd_kernel_dh(
         boh = i_n * NS
 
     if USE_G_GAMMA:
-        b_gamma = tl.load(g_gamma + i_h)
+        b_gamma = tl.load(g_gamma + i_hv)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
 
     # [BK, BV] accumulator; STATE_V_FIRST only flips the stored state's HBM layout to [V, K], applied at the load/store below.
@@ -233,7 +235,7 @@ def chunk_bwd_kernel_dh(
 
     for i_t in range(NT - 1, -1, -1):
         i_s = i_t // (BS // BT)
-        o_dh = ((boh + i_s) * H + i_h).to(tl.int64) * K*V
+        o_dh = ((boh + i_s) * HV + i_hv).to(tl.int64) * K*V
         if STATE_V_FIRST:
             p_dh = tl.make_block_ptr(dh + o_dh, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
         else:
@@ -243,16 +245,16 @@ def chunk_bwd_kernel_dh(
             tl.store(p_dh, (tl.trans(b_dh) if STATE_V_FIRST else b_dh).to(p_dh.dtype.element_ty), boundary_check=(0, 1))
         last_idx = min(i_t * BT + BT, T) - 1
         # [BK, BT]
-        p_q = tl.make_block_ptr(q + (bos*HQ + i_hq) * K, (K, T), (1, HQ*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        p_do = tl.make_block_ptr(do + (bos*HQ + i_hq) * V, (T, V), (HQ*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+        p_q = tl.make_block_ptr(q + (bos*H + i_h) * K, (K, T), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+        p_do = tl.make_block_ptr(do + (bos*HV + i_hv) * V, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_q = (b_q * scale).to(b_q.dtype)
         # [BT, BV]
         b_do = tl.load(p_do, boundary_check=(0, 1))
 
         if USE_G:
-            p_g = g + (bos + i_t * BT + tl.arange(0, BT)) * H + i_h
-            b_g_last = tl.load(g + (bos + last_idx) * H + i_h)
+            p_g = g + (bos + i_t * BT + tl.arange(0, BT)) * HV + i_hv
+            b_g_last = tl.load(g + (bos + last_idx) * HV + i_hv)
             b_g = tl.load(p_g, mask=(i_t * BT + tl.arange(0, BT) < T), other=0.)
             b_q = (b_q * exp2(b_g)[None, :]).to(b_q.dtype)
             b_dh *= exp2(b_g_last)
@@ -272,8 +274,8 @@ def chunk_bwd_kernel_dh(
             b_dh *= exp2(b_gk_last)[:, None]
 
         if USE_GV:
-            p_gv = tl.make_block_ptr(gv + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
-            p_gv_last = gv + (bos + last_idx) * H*V + i_h * V + i_v * BV + tl.arange(0, BV)
+            p_gv = tl.make_block_ptr(gv + (bos*HV + i_hv) * V, (T, V), (HV*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
+            p_gv_last = gv + (bos + last_idx) * HV*V + i_hv * V + i_v * BV + tl.arange(0, BV)
 
             b_gv = tl.load(p_gv, boundary_check=(0, 1))
             b_gv_last = tl.load(p_gv_last, mask=(i_v * BV + tl.arange(0, BV) < V), other=0.)
@@ -306,10 +308,11 @@ def chunk_fwd_h(
     split_size: int | None = None,
     states_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
     BS = BT if split_size is None else split_size
     assert BS % BT == 0, f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
+    assert HV >= H and HV % H == 0, f"Expected `v` heads ({HV}) to be a multiple of `k` heads ({H})."
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
         N, NS, split_offsets = B, triton.cdiv(T, BS), None
@@ -319,9 +322,9 @@ def chunk_fwd_h(
 
     # `state_v_first` stores the states in V-first `[V, K]` layout instead of `[K, V]`
     state_shape = (V, K) if state_v_first else (K, V)
-    h = k.new_empty(B, NS, H, *state_shape, dtype=k.dtype if not states_in_fp32 else torch.float)
-    ht = k.new_empty(N, H, *state_shape, dtype=torch.float) if output_final_state else None
-    def grid(meta): return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), N * H)
+    h = k.new_empty(B, NS, HV, *state_shape, dtype=k.dtype if not states_in_fp32 else torch.float)
+    ht = k.new_empty(N, HV, *state_shape, dtype=torch.float) if output_final_state else None
+    def grid(meta): return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), N * HV)
     chunk_fwd_kernel_h[grid](
         k=k,
         v=v,
@@ -336,6 +339,7 @@ def chunk_fwd_h(
         split_offsets=split_offsets,
         T=T,
         H=H,
+        HV=HV,
         K=K,
         V=V,
         BT=BT,
@@ -367,11 +371,11 @@ def chunk_bwd_dh(
     split_size: int | None = None,
     states_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, v.shape[-1]
-    HQ = q.shape[2]
+    B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
     BS = BT if split_size is None else split_size
     assert BS % BT == 0, f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
+    assert HV >= H and HV % H == 0, f"Expected `v` heads ({HV}) to be a multiple of `k` heads ({H})."
     # N: the actual number of sequences in the batch with either equal or variable lengths
     # NG: number of groups in GQA
     if cu_seqlens is None:
@@ -379,14 +383,14 @@ def chunk_bwd_dh(
     else:
         split_offsets = prepare_chunk_offsets(cu_seqlens, BS)
         N, NS = len(cu_seqlens) - 1, split_offsets[-1].item()
-    NG = HQ // H
+    NG = HV // H
 
     # `state_v_first` stores the states in V-first `[V, K]` layout instead of `[K, V]`
     state_shape = (V, K) if state_v_first else (K, V)
-    dh = k.new_empty(B, NS, HQ, *state_shape, dtype=k.dtype if not states_in_fp32 else torch.float)
+    dh = k.new_empty(B, NS, HV, *state_shape, dtype=k.dtype if not states_in_fp32 else torch.float)
     dh0 = torch.empty_like(h0, dtype=torch.float) if h0 is not None else None
 
-    def grid(meta): return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), N * H)
+    def grid(meta): return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), N * HV)
     chunk_bwd_kernel_dh[grid](
         q=q,
         g=g,
@@ -401,8 +405,8 @@ def chunk_bwd_dh(
         split_offsets=split_offsets,
         scale=scale,
         T=T,
-        HQ=HQ,
         H=H,
+        HV=HV,
         K=K,
         V=V,
         BT=BT,
